@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { useSearchParams, useNavigate, Link } from 'react-router-dom';
-import axios from 'axios';
+import { useNavigate, Link } from 'react-router-dom';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { CheckCircle, AlertCircle, Clock, Home, ArrowLeft } from 'lucide-react';
+import { teamsService, registrationsService } from '../services/databaseService';
+import type { Registration } from '../services/databaseService';
 
 interface VerificationResponse {
   success: boolean;
@@ -13,118 +14,103 @@ interface VerificationResponse {
     teamName?: string;
     domain?: string;
     memberCount: number;
-    paymentId: string;
-    amount?: number;
-    status?: 'success' | 'pending' | 'failed';
     registrationDate?: string;
     paymentStatus?: string;
-    orderId?: string;
   };
   error?: string;
 }
 
-interface PaymentDetails {
-  orderId: string;
-  paymentId: string;
-  signature: string;
-}
-
 const PaymentConfirmation: React.FC = () => {
-  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   
   const [verificationStatus, setVerificationStatus] = useState<'loading' | 'verified' | 'failed' | 'pending'>('loading');
   const [verificationData, setVerificationData] = useState<VerificationResponse['data'] | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>('');
-  const [paymentDetails, setPaymentDetails] = useState<PaymentDetails | null>(null);
-  const [registrationDetails, setRegistrationDetails] = useState<any | null>(null);
+  const [registrations, setRegistrations] = useState<Registration[]>([]);
 
   useEffect(() => {
-    const verifyPayment = async () => {
+    const fetchPaymentData = async () => {
       try {
-        // Get payment details from URL params
-        const orderId = searchParams.get('order_id');
-        const paymentId = searchParams.get('payment_id');
-        const signature = searchParams.get('signature');
-        const teamId = searchParams.get('team_id');
+        // Get team ID from sessionStorage
+        const teamIdStr = sessionStorage.getItem('registrationTeamId');
+        const teamName = sessionStorage.getItem('registrationTeamName');
+        const domain = sessionStorage.getItem('registrationDomain');
+        const membersJson = sessionStorage.getItem('registrationMembers');
 
-        // Get registration details from sessionStorage
-        const regDetailsJson = sessionStorage.getItem('registrationData');
-        const regDetails = regDetailsJson ? JSON.parse(regDetailsJson) : null;
-        setRegistrationDetails(regDetails);
-
-        if (!orderId || !paymentId || !signature) {
+        if (!teamIdStr) {
           setVerificationStatus('failed');
-          setErrorMessage('Missing payment verification parameters. Please contact support.');
+          setErrorMessage('No registration found. Please start the registration process again.');
           return;
         }
 
-        setPaymentDetails({ orderId, paymentId, signature });
+        const teamId = parseInt(teamIdStr);
 
-        console.log('Verifying payment with:', { orderId, paymentId, signature, teamId });
+        console.log('Fetching payment data for team:', teamId);
 
-        // Get members from sessionStorage
-        const membersJson = sessionStorage.getItem('registrationMembers');
-        const members = membersJson ? JSON.parse(membersJson) : [];
+        // Fetch team details from Supabase
+        const { data: teamData, error: teamError } = await teamsService.getTeamById(teamId);
 
-        // Call the verify-payment endpoint with camelCase keys and required fields
-        const response = await axios.post(
-          'https://zignasa-backend.vercel.app/razorpay/verify-payment',
-          {
-            teamId: teamId || 0,
-            razorpayOrderId: orderId,
-            razorpayPaymentId: paymentId,
-            razorpaySignature: signature,
-            members: members,
-          },
-          {
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            timeout: 10000,
-          }
-        );
-
-        console.log('Verification response:', response.data);
-
-        if (response.data.success) {
-          setVerificationStatus('verified');
-          setVerificationData(response.data.data);
-          // Clear sessionStorage after successful verification
-          sessionStorage.removeItem('registrationMembers');
-          sessionStorage.removeItem('registrationData');
-        } else {
+        if (teamError || !teamData) {
+          console.error('Error fetching team:', teamError);
           setVerificationStatus('failed');
-          setErrorMessage(response.data.message || 'Payment verification failed');
+          setErrorMessage('Failed to fetch team details. Please try again.');
+          return;
+        }
+
+        // Fetch team registrations
+        const { data: registrationData, error: regError } = await registrationsService.getTeamRegistrations(teamId);
+
+        if (regError) {
+          console.error('Error fetching registrations:', regError);
+          setVerificationStatus('failed');
+          setErrorMessage('Failed to fetch registration details.');
+          return;
+        }
+
+        console.log('Team data:', teamData);
+        console.log('Registration data:', registrationData);
+
+        // Check payment status
+        if (teamData.payment_status === 'Completed' && teamData.razorpay_payment_id) {
+          // Payment verified
+          setVerificationStatus('verified');
+          setVerificationData({
+            teamId: teamData.id,
+            teamName: teamData.team_name,
+            domain: teamData.domain,
+            memberCount: teamData.team_size,
+            registrationDate: teamData.created_at,
+            paymentStatus: teamData.payment_status
+          });
+          setRegistrations(registrationData || []);
+          
+          // Clear sessionStorage after successful verification
+          sessionStorage.removeItem('registrationTeamId');
+          sessionStorage.removeItem('registrationTeamName');
+          sessionStorage.removeItem('registrationDomain');
+          sessionStorage.removeItem('registrationMembers');
+        } else if (teamData.payment_status === 'Pending' || teamData.payment_status === 'Initiated') {
+          // Payment still pending
+          setVerificationStatus('pending');
+          setErrorMessage('Payment is still being processed. Please wait or try refreshing the page.');
+        } else if (teamData.payment_status === 'Failed' || teamData.payment_status === 'Refunded') {
+          // Payment failed
+          setVerificationStatus('failed');
+          setErrorMessage(`Payment ${teamData.payment_status.toLowerCase()}. Please try registering again.`);
+        } else {
+          // Unknown status
+          setVerificationStatus('failed');
+          setErrorMessage('Unable to determine payment status. Please contact support.');
         }
       } catch (error) {
         console.error('Verification error:', error);
-        
-        if (axios.isAxiosError(error)) {
-          if (error.response?.status === 409) {
-            // Payment already verified
-            setVerificationStatus('verified');
-            setErrorMessage('');
-            if (error.response.data?.data) {
-              setVerificationData(error.response.data.data);
-            }
-          } else {
-            setVerificationStatus('failed');
-            setErrorMessage(
-              error.response?.data?.message || 
-              error.message || 
-              'Failed to verify payment. Please contact support.'
-            );
-          }
-        } else {
-          setVerificationStatus('failed');
-          setErrorMessage('An unexpected error occurred during verification.');
-        }
+        setVerificationStatus('failed');
+        setErrorMessage('An unexpected error occurred. Please contact support.');
       }
     };
 
-    verifyPayment();
-  }, [searchParams]);
+    fetchPaymentData();
+  }, []);
 
   // Success state
   if (verificationStatus === 'verified' && verificationData) {
@@ -182,42 +168,35 @@ const PaymentConfirmation: React.FC = () => {
                   <div className="bg-white/[0.03] backdrop-blur-lg border border-white/10 rounded-lg sm:rounded-xl p-4 sm:p-6 hover:bg-white/[0.05] hover:border-white/15 transition-all duration-300">
                     <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Team Name</p>
                     <p className="text-white text-sm sm:text-base font-semibold break-words">
-                      {verificationData?.teamName || registrationDetails?.teamName || 'N/A'}
+                      {verificationData?.teamName || 'N/A'}
                     </p>
                   </div>
 
                   <div className="bg-white/[0.03] backdrop-blur-lg border border-white/10 rounded-lg sm:rounded-xl p-4 sm:p-6 hover:bg-white/[0.05] hover:border-white/15 transition-all duration-300">
                     <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Domain</p>
                     <p className="text-white text-sm sm:text-base font-semibold break-words">
-                      {verificationData?.domain || registrationDetails?.domain || 'N/A'}
+                      {verificationData?.domain || 'N/A'}
                     </p>
                   </div>
 
                   <div className="bg-white/[0.03] backdrop-blur-lg border border-white/10 rounded-lg sm:rounded-xl p-4 sm:p-6 hover:bg-white/[0.05] hover:border-white/15 transition-all duration-300">
                     <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Team Members</p>
                     <p className="text-white text-sm sm:text-base font-semibold">
-                      {verificationData?.memberCount || registrationDetails?.memberCount || 'N/A'}
+                      {verificationData?.memberCount || 'N/A'}
                     </p>
                   </div>
 
                   <div className="bg-white/[0.03] backdrop-blur-lg border border-white/10 rounded-lg sm:rounded-xl p-4 sm:p-6 hover:bg-white/[0.05] hover:border-white/15 transition-all duration-300">
-                    <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Payment Amount</p>
+                    <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Payment Status</p>
                     <p className="text-white text-sm sm:text-base font-semibold">
-                      ₹{verificationData?.amount || registrationDetails?.amount || 'N/A'}
+                      {verificationData?.paymentStatus || 'Verified'}
                     </p>
                   </div>
 
                   <div className="bg-white/[0.03] backdrop-blur-lg border border-white/10 rounded-lg sm:rounded-xl p-4 sm:p-6 hover:bg-white/[0.05] hover:border-white/15 transition-all duration-300">
-                    <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Registration ID</p>
-                    <p className="text-white text-sm sm:text-base font-semibold font-mono break-words">
-                      {verificationData?.teamId || 'N/A'}
-                    </p>
-                  </div>
-
-                  <div className="bg-white/[0.03] backdrop-blur-lg border border-white/10 rounded-lg sm:rounded-xl p-4 sm:p-6 hover:bg-white/[0.05] hover:border-white/15 transition-all duration-300">
-                    <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Payment ID</p>
-                    <p className="text-white text-sm sm:text-base font-semibold font-mono break-words">
-                      {verificationData?.paymentId ? verificationData.paymentId.slice(0, 12) + '...' : 'N/A'}
+                    <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Registration Date</p>
+                    <p className="text-white text-sm sm:text-base font-semibold">
+                      {verificationData?.registrationDate ? new Date(verificationData.registrationDate).toLocaleDateString() : 'N/A'}
                     </p>
                   </div>
                 </div>
@@ -316,34 +295,12 @@ const PaymentConfirmation: React.FC = () => {
                 </p>
               </div>
 
-              {/* Payment Details (if available) */}
-              {paymentDetails && (
-                <div className="space-y-4 sm:space-y-6">
-                  <h3 className="text-white font-semibold text-lg sm:text-xl">Payment Information</h3>
-                  
-                  <div className="bg-white/[0.03] backdrop-blur-lg border border-white/10 rounded-lg sm:rounded-xl p-4 sm:p-6 space-y-4">
-                    <div>
-                      <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Payment ID</p>
-                      <p className="text-white text-sm sm:text-base font-mono break-all">
-                        {paymentDetails.paymentId}
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-gray-400 text-xs sm:text-sm font-medium mb-2">Order ID</p>
-                      <p className="text-white text-sm sm:text-base font-mono break-all">
-                        {paymentDetails.orderId}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              )}
-
               {/* Support Instructions */}
               <div className="bg-purple-500/10 border border-purple-500/30 rounded-xl sm:rounded-2xl p-4 sm:p-6 backdrop-blur-sm">
                 <h4 className="text-purple-200 font-semibold text-sm sm:text-base mb-2">What to do next?</h4>
                 <ul className="text-purple-200 text-xs sm:text-sm space-y-2 list-disc list-inside">
-                  <li>If you were charged, your payment will be refunded within 3-5 business days</li>
-                  <li>Contact support with your Payment ID for assistance</li>
+                  <li>Contact support with your Team ID and provide payment details</li>
+                  <li>Our team will assist you in resolving the payment issue</li>
                   <li>Try registering again with a different payment method</li>
                 </ul>
               </div>
